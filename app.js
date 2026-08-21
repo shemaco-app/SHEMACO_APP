@@ -63,6 +63,7 @@ function toast(msg) { const el = document.getElementById("toast"); el.textConten
 
 /* ───────────── State ───────────── */
 let activeTab = "dashboard";
+let serverSnapshot = null;
 let inspStep = 0;
 let inspState = { unitId: null, unitIsNew: false, aparAvailable: null, checklist: {}, photo: null, gps: null, sigHasContent: false };
 let activeStokTab = "masuk";
@@ -407,46 +408,91 @@ async function pullFromSheet({ quiet = false } = {}) {
   if (!navigator.onLine) return false;
   try {
     const data = await loadSheetData();
-    if (!data) return false;
-    await cacheSheetData(data);
-    await renderDashboard();
+    if (!data || data.ok === false) throw new Error(data?.message || "Respons backend tidak valid");
+
+    // Keep a live server snapshot so the online dashboard does not depend on
+    // IndexedDB hydration succeeding before it can show Google Sheet data.
+    serverSnapshot = data;
+    await renderDashboard(data);
+
+    // Cache after rendering. If caching has a problem, online data still shows.
+    try {
+      await cacheSheetData(data);
+    } catch (cacheErr) {
+      console.error("Google Sheet cache failed", cacheErr);
+    }
+
     if (activeTab === "stok") await renderStokSummary();
-    if (!quiet) toast("Data Google Sheet diperbarui");
+    const remoteCount = Array.isArray(data.inspectionLogs) ? data.inspectionLogs.length : (Array.isArray(data.inspections) ? data.inspections.length : 0);
+    updateStatusPill();
+    if (!quiet) toast(`Database terhubung • ${remoteCount} inspeksi`);
     return true;
   } catch (err) {
     console.error("Google Sheet pull failed", err);
-    if (!quiet) toast("Data Sheet belum dapat dimuat");
+    serverSnapshot = null;
+    if (!quiet) toast("Database gagal dimuat: " + err.message);
     return false;
   }
 }
 
 /* ───────────── Dashboard ───────────── */
-async function renderDashboard() {
-  const [ins, sIn, sOut] = await Promise.all([dbGetAll("inspections"), dbGetAll("stock_in"), dbGetAll("stock_out")]);
-  const today = todayISO();
+async function renderDashboard(snapshot = serverSnapshot) {
+  let ins, sIn, sOut;
 
-  // Stock sisa
-  const in6 = sIn.filter(r => r.jenis === "APAR 6KG").reduce((a, r) => a + (parseInt(r.jumlah) || 0), 0);
-  const in3 = sIn.filter(r => r.jenis === "APAR 3KG").reduce((a, r) => a + (parseInt(r.jumlah) || 0), 0);
-  const out6 = sOut.filter(r => r.jenis === "APAR 6KG").length;
-  const out3 = sOut.filter(r => r.jenis === "APAR 3KG").length;
+  if (snapshot && snapshot.ok !== false) {
+    const rawIns = Array.isArray(snapshot.inspectionLogs) && snapshot.inspectionLogs.length
+      ? snapshot.inspectionLogs
+      : (snapshot.inspections || []);
+    ins = rawIns.map(r => ({
+      id: r.inspection_id || r.id || "",
+      date: r.timestamp || r.inspection_date || r.date || "",
+      inspectionDate: r.inspection_date || (r.date ? String(r.date).slice(0, 10) : ""),
+      unitId: r.apar_code || r.generated_code || r.unitId || "",
+      inspectorName: r.inspector || r.inspectorName || "",
+      result: r.result || "",
+      aparAvailable: r.apar_available || r.aparAvailable || "ya"
+    }));
+    sIn = Array.isArray(snapshot.stockIn) ? snapshot.stockIn : [];
+    sOut = Array.isArray(snapshot.stockOut) ? snapshot.stockOut : [];
+  } else {
+    [ins, sIn, sOut] = await Promise.all([dbGetAll("inspections"), dbGetAll("stock_in"), dbGetAll("stock_out")]);
+  }
+
+  const today = todayISO();
+  const norm = v => String(v || "").toUpperCase().replace(/\s+/g, "").replace(/APAR/g, "");
+  const is6 = v => /(^|[^0-9])6(KG)?($|[^0-9])/.test(norm(v)) || norm(v) === "6KG" || norm(v) === "6";
+  const is3 = v => /(^|[^0-9])3(KG)?($|[^0-9])/.test(norm(v)) || norm(v) === "3KG" || norm(v) === "3";
+
+  // Stock: accept APAR 6KG, APAR 6 Kg, 6KG, 6 Kg, etc.
+  const in6 = sIn.filter(r => is6(r.jenis || r.type || r.kapasitas)).reduce((a, r) => a + (Number(r.jumlah) || 0), 0);
+  const in3 = sIn.filter(r => is3(r.jenis || r.type || r.kapasitas)).reduce((a, r) => a + (Number(r.jumlah) || 0), 0);
+  const out6 = sOut.filter(r => is6(r.jenis || r.type || r.kapasitas)).length;
+  const out3 = sOut.filter(r => is3(r.jenis || r.type || r.kapasitas)).length;
   document.getElementById("dash6kg").textContent = Math.max(0, in6 - out6);
   document.getElementById("dash3kg").textContent = Math.max(0, in3 - out3);
 
-  const todayIns = ins.filter(i => i.date && i.date.startsWith(today));
+  const todayIns = ins.filter(i => {
+    const d = i.inspectionDate || (i.date ? String(i.date).slice(0, 10) : "");
+    return d === today;
+  });
   document.getElementById("dashToday").textContent = todayIns.length;
-  document.getElementById("dashIssues").textContent = ins.filter(i => i.result === "tidak_ok").length;
+  document.getElementById("dashIssues").textContent = ins.filter(i => i.result === "tidak_ok" || i.result === "apar_tidak_tersedia").length;
 
-  const recent = [...ins].sort((a, b) => new Date(b.date) - new Date(a.date)).slice(0, 15);
+  const recent = [...ins].sort((a, b) => new Date(b.date || b.inspectionDate) - new Date(a.date || a.inspectionDate)).slice(0, 15);
   const list = document.getElementById("recentList");
-  list.innerHTML = recent.length ? recent.map(i => `
-    <div class="item-card ${i.result || "ok"}">
+  list.innerHTML = recent.length ? recent.map(i => {
+    const unavailable = i.result === "apar_tidak_tersedia" || String(i.aparAvailable).toLowerCase() === "tidak";
+    const issue = i.result === "tidak_ok" || unavailable;
+    const badge = unavailable ? "APAR Tidak Tersedia" : (issue ? "Perlu Perhatian" : "OK");
+    return `
+    <div class="item-card ${issue ? "tidak_ok" : "ok"}">
       <div class="row">
-        <div class="title mono">${escapeHtml(i.unitId)}</div>
-        <div class="badge ${i.result || "ok"}">${i.result === "tidak_ok" ? "Perlu Perhatian" : "OK"}</div>
+        <div class="title mono">${escapeHtml(String(i.unitId || "-"))}</div>
+        <div class="badge ${issue ? "tidak_ok" : "ok"}">${badge}</div>
       </div>
-      <div class="sub">${escapeHtml(i.inspectorName)} &mdash; ${fmtDT(i.date)}</div>
-    </div>`).join("") : `<div class="empty-state">Belum ada inspeksi tersimpan</div>`;
+      <div class="sub">${escapeHtml(String(i.inspectorName || "-"))} &mdash; ${fmtDT(i.date || i.inspectionDate)}</div>
+    </div>`;
+  }).join("") : `<div class="empty-state">Belum ada inspeksi tersimpan</div>`;
 }
 
 /* ───────────── Scanner ───────────── */

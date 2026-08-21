@@ -1,4 +1,4 @@
-const CACHE_NAME = "apar-inspector-v14-active-endpoint";
+const CACHE_NAME = "apar-inspector-v15-active-endpoint";
 const SHELL_FILES = [
   "./",
   "./index.html",
